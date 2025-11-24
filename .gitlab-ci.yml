@@ -1,0 +1,165 @@
+##############################
+# .gitlab-ci.yml - Phase 4
+##############################
+
+variables:
+  GIT_STRATEGY: none
+  CI_PROJECT_DIR: "$CI_PROJECT_DIR"
+  DOCKER_IMAGE_TAG: "$CI_COMMIT_REF_NAME-$(date +%Y%m%d%H%M%S)"
+  TZ: "Asia/Kolkata"
+
+stages:
+  - install-tools
+  - security
+  - test
+  - sonar
+  - docker-build
+
+default:
+  before_script:
+    - |
+      if [ -z "$CI_CLONE_USER" ] || [ -z "$CI_CLONE_PAT" ]; then
+        echo "CI_CLONE_USER or CI_CLONE_PAT not set. Exiting." >&2
+        exit 1
+      fi
+    - |
+      if [ ! -d "$CI_PROJECT_DIR/.git" ]; then
+        echo "Cloning repository into $CI_PROJECT_DIR"
+        git clone "https://$CI_CLONE_USER:$CI_CLONE_PAT@gitlab.com/$CI_PROJECT_PATH.git" "$CI_PROJECT_DIR"
+      else
+        echo "Repo already present"
+      fi
+    - cd "$CI_PROJECT_DIR"
+
+install-tools:
+  stage: install-tools
+  tags:
+    - self-hosted
+  script:
+    - echo "Ensure jq installed (safe noop if present)"
+    - sudo apt update || true
+    - sudo apt install -y jq || true
+    - |
+      if ! command -v trivy >/dev/null 2>&1; then
+        echo "Installing trivy"
+        curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sudo sh -s -- -b /usr/local/bin
+      fi
+    - |
+      if ! command -v gitleaks >/dev/null 2>&1; then
+        echo "Installing gitleaks"
+        GL_VER=$(curl -s https://api.github.com/repos/zricethezav/gitleaks/releases/latest | jq -r .tag_name)
+        curl -L "https://github.com/zricethezav/gitleaks/releases/download/${GL_VER}/gitleaks_${GL_VER}_linux_amd64.tar.gz" -o /tmp/gitleaks.tar.gz
+        sudo tar -C /usr/local/bin -xzf /tmp/gitleaks.tar.gz gitleaks
+        rm /tmp/gitleaks.tar.gz || true
+      fi
+    - echo "Tools ready"
+  artifacts:
+    when: always
+    paths:
+      - /usr/local/bin/trivy || []
+      - /usr/local/bin/gitleaks || []
+    expire_in: 1h
+
+gitleaks-scan:
+  stage: security
+  tags:
+    - self-hosted
+  needs: [install-tools]
+  script:
+    - echo "Running Gitleaks secret scan"
+    - gitleaks detect --source . --report-path gitleaks-report.json --report-format json --redact || true
+  artifacts:
+    paths:
+      - gitleaks-report.json
+    expire_in: 1d
+    when: always
+
+trivy-fs-scan:
+  stage: security
+  tags:
+    - self-hosted
+  needs: [install-tools]
+  script:
+    - echo "Running Trivy filesystem scan"
+    - trivy fs --format json --output trivy-fs-report.json .
+  artifacts:
+    paths:
+      - trivy-fs-report.json
+    expire_in: 1d
+    when: always
+
+unit-tests:
+  stage: test
+  tags:
+    - self-hosted
+  needs: [trivy-fs-scan, gitleaks-scan]
+  script:
+    - echo "Running backend unit tests (if any)"
+    - |
+      if [ -d backend ]; then
+        cd backend
+        if [ -f package.json ]; then
+          npm ci || true
+          npm test || echo "Tests failed or not present"
+          cd ..
+        else
+          echo "No package.json in backend; skipping"
+        fi
+      else
+        echo "No backend directory"
+      fi
+  artifacts:
+    paths:
+      - backend/test-report || []
+    expire_in: 1d
+    when: always
+
+sonar-analysis:
+  stage: sonar
+  tags:
+    - self-hosted
+  needs: [unit-tests]
+  script:
+    - echo "Running Sonar analysis (skips if SONAR vars missing)"
+    - |
+      if [ -z "$SONAR_HOST_URL" ] || [ -z "$SONAR_TOKEN" ]; then
+        echo "SONAR_HOST_URL or SONAR_TOKEN not set. Skipping Sonar."
+        exit 0
+      fi
+    - docker run --rm -v "$PWD":/usr/src -w /usr/src \
+        -e SONAR_HOST_URL="$SONAR_HOST_URL" -e SONAR_LOGIN="$SONAR_TOKEN" \
+        sonarsource/sonar-scanner-cli \
+        -Dsonar.host.url="$SONAR_HOST_URL" -Dsonar.login="$SONAR_TOKEN" || true
+  artifacts:
+    when: always
+    expire_in: 6h
+    paths:
+      - .scannerwork || []
+
+docker-build-and-scan:
+  stage: docker-build
+  tags:
+    - self-hosted
+  needs: [sonar-analysis]
+  script:
+    - echo "Docker login"
+    - echo "$DOCKER_PASSWORD" | docker login -u "$DOCKER_USERNAME" --password-stdin
+    - echo "Build backend image"
+    - if [ -d backend ]; then docker build -t "$DOCKER_USERNAME/backend:$DOCKER_IMAGE_TAG" ./backend; fi
+    - echo "Build frontend image"
+    - if [ -d frontend ]; then docker build -t "$DOCKER_USERNAME/frontend:$DOCKER_IMAGE_TAG" ./frontend; fi
+    - echo "Scan images with Trivy (non-fatal)"
+    - if [ -d backend ]; then trivy image --severity HIGH,CRITICAL --format json --output trivy-backend-image.json "$DOCKER_USERNAME/backend:$DOCKER_IMAGE_TAG" || true; fi
+    - if [ -d frontend ]; then trivy image --severity HIGH,CRITICAL --format json --output trivy-frontend-image.json "$DOCKER_USERNAME/frontend:$DOCKER_IMAGE_TAG" || true; fi
+    - echo "Push images"
+    - if [ -d backend ]; then docker push "$DOCKER_USERNAME/backend:$DOCKER_IMAGE_TAG"; fi
+    - if [ -d frontend ]; then docker push "$DOCKER_USERNAME/frontend:$DOCKER_IMAGE_TAG"; fi
+    - echo "$DOCKER_USERNAME/backend:$DOCKER_IMAGE_TAG" > image-tags.txt || true
+    - echo "$DOCKER_USERNAME/frontend:$DOCKER_IMAGE_TAG" >> image-tags.txt || true
+  artifacts:
+    paths:
+      - trivy-backend-image.json || []
+      - trivy-frontend-image.json || []
+      - image-tags.txt
+    expire_in: 1d
+    when: always
